@@ -21,7 +21,7 @@ namespace Common {
     template<typename T, typename... A>
     inline auto createAndStartThread(int core_id, const std::string& name, T&& func, A&&... args) noexcept {
         auto t = new std::thread([core_id, 
-                                  name = std::move(name), 
+                                  &name, 
                                   func = std::forward<T>(func), 
                                   ...args = std::forward<A>(args)]() mutable {
             if(core_id >= 0 && !setThreadCore(core_id)){
