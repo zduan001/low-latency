@@ -4,77 +4,77 @@
 #include <semaphore.h>
 
 namespace tdsys {
-    // 带信号量的多生产者单消费者队列，用于非低时延HFT辅助通道
+    // Multi-producer single-consumer queue with a semaphore, for non-latency-critical HFT auxiliary channels
     template<typename T, size_t SZ = 127>
     class MsgQueue {
     private:
-        // 队列长度对齐为2的幂（HFT标准优化）：LEN = 1<<n，确保下标可通过位运算快速计算
+        // Queue length rounded up to a power of 2 (standard HFT optimization): LEN = 1<<n, so indices can be computed with bit ops
         static constexpr size_t LEN = 1 << std::bit_width(SZ);
-        // 掩码：替代取模运算，CPU单周期完成，降低延迟
+        // Mask: replaces modulo, completes in a single CPU cycle, lowers latency
         static constexpr size_t MASK = LEN - 1;
-        // 版本号占用位数（16位）：用于解决ABA问题，高16位版本，低16位下标
+        // Number of index bits (16): used to solve the ABA problem; high bits hold the version, low 16 bits hold the index
         static constexpr size_t IB = 16;
-        // 下标掩码：提取低16位下标
+        // Index mask: extracts the low 16-bit index
         static constexpr size_t IM = (1ULL << IB) - 1;
 
-        // 队列元素包装：data存储数据，ok标记数据是否写入完成（多生产者场景必备）
-        // 多生产者并发写入时，需确保数据完全写入后，消费者才能读取，避免数据错乱
+        // Queue slot wrapper: data holds the payload, ok marks whether the write has completed (required for multiple producers)
+        // With concurrent producers, the consumer must only read after the data is fully written, to avoid corrupted reads
         struct W {
-            std::atomic<bool> ok{ false };  // 数据就绪标记，原子操作保证可见性
-            T data{};                      // 存储实际消息数据，默认初始化
+            std::atomic<bool> ok{ false };  // Data-ready flag, atomic to guarantee visibility
+            T data{};                      // Actual message payload, default-initialized
         };
 
-        // 缓存行对齐（64字节）：h（头指针）、vt（带版本的尾指针）分别独占缓存行，杜绝伪共享
-        // 伪共享会导致多核CPU缓存乒乓，增加延迟，这是HFT队列的关键优化点
+        // Cache-line alignment (64 bytes): h (head) and vt (versioned tail) each get their own cache line to prevent false sharing
+        // False sharing causes cache-line ping-pong between cores and adds latency; this is a key HFT queue optimization
         alignas(64) std::atomic<size_t> h{ 0 }, vt{ 0 };
-        sem_t sem{};                          // 信号量：消费者阻塞等待，避免空转
-        std::array<W, LEN> buf{};             // 静态环形缓冲区，无动态内存分配
+        sem_t sem{};                          // Semaphore: consumer blocks while waiting instead of busy-spinning
+        std::array<W, LEN> buf{};             // Static ring buffer, no dynamic memory allocation
 
     public:
-        // 构造函数：初始化信号量，pshared=1表示跨进程共享（可适配多进程HFT系统），初始值0表示无消息
+        // Constructor: initialize the semaphore; pshared=1 means shared across processes (suits multi-process HFT systems), initial value 0 means no messages
         MsgQueue() { sem_init(&sem, 1, 0); }
-        // 析构函数：销毁信号量，避免资源泄漏（HFT系统需保证无资源泄漏，否则会导致系统不稳定）
+        // Destructor: destroy the semaphore to avoid resource leaks (HFT systems must not leak resources, or they become unstable)
         ~MsgQueue() { sem_destroy(&sem); }
 
-        // 多生产者并发入队（无锁，CAS抢占写入权），支持右值引用，避免拷贝，降低延迟
+        // Concurrent multi-producer enqueue (lock-free, CAS to claim the write slot); accepts rvalue references to avoid copies and lower latency
         template<typename U>
         bool push(U&& u) {
-            size_t v;  // 版本号临时变量
+            size_t v;  // Temporary for the version number
             while (true) {
-                // 加载带版本的尾指针：acquire内存序，保证读取到最新的vt值，避免数据过期
+                // Load the versioned tail: acquire ordering ensures we see the latest vt value, not a stale one
                 auto lvt = vt.load(std::memory_order_acquire);
-                auto lt = lvt & IM;                          // 提取低16位下标
-                auto n = (lt + 1) & MASK;                    // 计算下一个写入位置，位运算替代取模
-                auto hh = h.load(std::memory_order_acquire) & IM; // 读取头指针下标，判断队列是否满
-                if (n == hh) return false;                   // 队列满，入队失败（HFT场景下通常会重试，此处按原代码实现）
+                auto lt = lvt & IM;                          // Extract the low 16-bit index
+                auto n = (lt + 1) & MASK;                    // Compute next write position, bit op instead of modulo
+                auto hh = h.load(std::memory_order_acquire) & IM; // Read the head index to check whether the queue is full
+                if (n == hh) return false;                   // Queue full, enqueue fails (HFT code would usually retry; kept as in the original)
 
-                // 版本号+1：高16位版本号自增，解决ABA问题，避免CAS误判
+                // Version + 1: increment the version in the high bits to solve ABA and avoid false CAS success
                 v = (lvt >> IB) + 1;
-                size_t nvt = (v << IB) | n;                  // 新的带版本尾指针
+                size_t nvt = (v << IB) | n;                  // New versioned tail
 
-                // CAS抢占写入权：compare_exchange_strong是原子操作，失败则重试
-                // acq_rel内存序：保证CAS成功后，之前的写入操作可见，后续的读取操作能看到最新数据
+                // CAS to claim the write slot: compare_exchange_strong is atomic; retry on failure
+                // acq_rel ordering: after a successful CAS, prior writes are visible and subsequent reads see the latest data
                 if (vt.compare_exchange_strong(lvt, nvt, std::memory_order_acq_rel)) {
                     auto& w = buf[lt];
-                    w.data = std::forward<U>(u);             // 右值引用，完美转发，避免拷贝开销
-                    w.ok.store(true, std::memory_order_release); // 标记数据就绪，release保证写入可见
-                    sem_post(&sem);                          // 唤醒消费者（非核心链路，允许系统调用）
+                    w.data = std::forward<U>(u);             // Perfect forwarding of rvalue references, avoids copy overhead
+                    w.ok.store(true, std::memory_order_release); // Mark data ready; release makes the write visible
+                    sem_post(&sem);                          // Wake the consumer (non-critical path, system calls are allowed)
                     return true;
                 }
             }
         }
 
-        // 单消费者出队（阻塞式），适用于非核心链路，允许轻微阻塞
+        // Single-consumer dequeue (blocking), for non-critical paths where slight blocking is acceptable
         bool pop(T& out) {
-            sem_wait(&sem);                                  // 阻塞等待消息，避免消费者空转，节约CPU
-            auto lh = h.load(std::memory_order_relaxed);     // 读取头指针，relaxed无同步开销，仅保证原子性
-            auto tail = vt.load(std::memory_order_acquire) & IM; // 读取尾指针下标，acquire保证可见性
-            if (lh == tail) return false;                   // 队列空，出队失败（理论上不会出现，因sem信号量控制）
+            sem_wait(&sem);                                  // Block waiting for a message, avoids consumer busy-spinning and saves CPU
+            auto lh = h.load(std::memory_order_relaxed);     // Read head; relaxed has no sync overhead, only guarantees atomicity
+            auto tail = vt.load(std::memory_order_acquire) & IM; // Read the tail index; acquire guarantees visibility
+            if (lh == tail) return false;                   // Queue empty, dequeue fails (shouldn't happen in theory, since the semaphore controls it)
             auto& w = buf[lh];
-            if (!w.ok.load(std::memory_order_acquire)) return false; // 确保数据已写入完成
-            out = std::move(w.data);                        // 移动语义，零拷贝，降低延迟
-            w.ok.store(false, std::memory_order_release);   // 重置就绪标记，允许下一次写入
-            h.store((lh + 1) & MASK, std::memory_order_release); // 更新头指针，release保证可见性
+            if (!w.ok.load(std::memory_order_acquire)) return false; // Ensure the data has been fully written
+            out = std::move(w.data);                        // Move semantics, zero copy, lower latency
+            w.ok.store(false, std::memory_order_release);   // Reset ready flag, allowing the next write
+            h.store((lh + 1) & MASK, std::memory_order_release); // Update head; release guarantees visibility
             return true;
         }
     };
@@ -87,48 +87,48 @@ namespace tdsys {
 #include <array>
 
 namespace tdsys {
-    // 单生产者单消费者极致低时延无锁队列，HFT核心链路专用
+    // Single-producer single-consumer ultra-low-latency lock-free queue, for the HFT critical path
     template<typename T, size_t SZ = 127>
     class SPSCQueue {
     private:
-        // 队列长度对齐为2的幂，HFT标准设计，位运算替代取模
+        // Queue length rounded up to a power of 2, standard HFT design, bit ops instead of modulo
         static constexpr size_t LEN = 1 << std::bit_width(SZ);
         static constexpr size_t MASK = LEN - 1;
 
-        // 头指针（消费者修改）、尾指针（生产者修改），分别缓存行对齐，杜绝伪共享
-        // 单生产者仅修改t，单消费者仅修改h，无任何竞争，无需CAS
+        // Head (modified by consumer) and tail (modified by producer), each cache-line aligned to prevent false sharing
+        // The single producer only modifies t and the single consumer only modifies h: no contention, no CAS needed
         alignas(64) std::atomic<size_t> h{ 0 }, t{ 0 };
-        // 本地缓存sh、st：减少原子变量加载次数，原子操作比普通变量访问慢10倍以上，这是HFT关键优化
+        // Local caches sh, st: reduce atomic loads; atomic ops can be 10x+ slower than plain accesses; a key HFT optimization
         alignas(64) size_t sh = 0, st = 0;
-        std::array<T, LEN> buf{}; // 静态环形缓冲区，无动态内存分配，延迟可控
+        std::array<T, LEN> buf{}; // Static ring buffer, no dynamic memory allocation, predictable latency
 
     public:
-        // 消费者出队：单线程操作，无竞争，延迟极低
+        // Consumer dequeue: single-threaded, no contention, very low latency
         bool pop(T& out) {
-            auto lh = h.load(std::memory_order_relaxed); // 读取头指针，relaxed无同步开销
-            // 本地缓存st判断，避免频繁加载原子变量t（原子加载开销高）
+            auto lh = h.load(std::memory_order_relaxed); // Read head; relaxed has no sync overhead
+            // Check against cached st first to avoid frequently loading atomic t (atomic loads are expensive)
             if (lh != st && (st = t.load(std::memory_order_acquire)) != lh) {
-                out = std::move(buf[lh]);                // 移动语义，零拷贝，降低延迟
-                // 更新头指针：release内存序，保证出队后的数据修改可见
+                out = std::move(buf[lh]);                // Move semantics, zero copy, lower latency
+                // Update head: release ordering makes post-dequeue changes visible
                 h.store((lh + 1) & MASK, std::memory_order_release);
                 return true;
             }
-            return false; // 队列空，出队失败（HFT场景下通常会自旋重试，此处按原代码实现）
+            return false; // Queue empty, dequeue fails (HFT code would usually spin and retry; kept as in the original)
         }
 
-        // 生产者入队：单线程操作，无竞争，无需CAS
+        // Producer enqueue: single-threaded, no contention, no CAS needed
         template<typename U>
         bool push(U&& u) {
-            auto lt = t.load(std::memory_order_relaxed); // 读取尾指针，relaxed无同步开销
-            auto n = (lt + 1) & MASK;                   // 计算下一个写入位置，位运算替代取模
-            // 本地缓存sh判断，避免频繁加载原子变量h
+            auto lt = t.load(std::memory_order_relaxed); // Read tail; relaxed has no sync overhead
+            auto n = (lt + 1) & MASK;                   // Compute next write position, bit op instead of modulo
+            // Check against cached sh first to avoid frequently loading atomic h
             if (n != sh && (sh = h.load(std::memory_order_acquire)) != n) {
-                buf[lt] = std::forward<U>(u);            // 完美转发，避免拷贝
-                // 更新尾指针：release内存序，保证入队数据可见
+                buf[lt] = std::forward<U>(u);            // Perfect forwarding, avoids copies
+                // Update tail: release ordering makes the enqueued data visible
                 t.store((lt + 1) & MASK, std::memory_order_release);
                 return true;
             }
-            return false; // 队列满，入队失败（HFT场景下会重试，此处按原代码实现）
+            return false; // Queue full, enqueue fails (HFT code would retry; kept as in the original)
         }
     };
 }
@@ -138,57 +138,57 @@ namespace tdsys {
 #include <array>
 
 namespace tdsys {
-    // 单生产者多消费者无锁队列，HFT行情广播、多策略并行消费专用
+    // Single-producer multi-consumer lock-free queue, for HFT market-data broadcast and parallel multi-strategy consumption
     template<typename T, size_t SZ = 127>
     class SPMCQueue {
     private:
-        // 队列长度对齐为2的幂，HFT标准设计，位运算替代取模
+        // Queue length rounded up to a power of 2, standard HFT design, bit ops instead of modulo
         static constexpr size_t LEN = 1 << std::bit_width(SZ);
         static constexpr size_t MASK = LEN - 1;
-        // 版本号占用16位，下标占用16位，解决多消费者CAS竞争的ABA问题
+        // Version in the high bits, index in the low 16 bits, solving ABA under multi-consumer CAS contention
         static constexpr size_t IB = 16;
         static constexpr size_t IM = (1ULL << IB) - 1;
 
-        // 带版本的头指针（多消费者CAS竞争修改）、尾指针（单生产者修改，无竞争）
-        // 缓存行对齐，避免伪共享
+        // Versioned head (contended via CAS by multiple consumers) and tail (modified by the single producer, uncontended)
+        // Cache-line aligned to avoid false sharing
         alignas(64) std::atomic<size_t> vh{ 0 }, t{ 0 };
-        std::array<T, LEN> buf{}; // 静态环形缓冲区，无动态内存分配
+        std::array<T, LEN> buf{}; // Static ring buffer, no dynamic memory allocation
 
     public:
-        // 单生产者入队：无竞争，无需CAS，延迟极低
+        // Single-producer enqueue: no contention, no CAS needed, very low latency
         template<typename U>
         bool push(U&& u) {
-            auto lt = t.load(std::memory_order_relaxed); // 读取尾指针，relaxed无同步开销
-            auto n = (lt + 1) & MASK;                   // 计算下一个写入位置
-            // 读取带版本的头指针，判断队列是否满，acquire保证可见性
+            auto lt = t.load(std::memory_order_relaxed); // Read tail; relaxed has no sync overhead
+            auto n = (lt + 1) & MASK;                   // Compute next write position
+            // Read the versioned head to check whether the queue is full; acquire guarantees visibility
             auto hh = vh.load(std::memory_order_acquire) & IM;
-            if (n == hh) return false;                   // 队列满，入队失败
-            buf[lt] = std::forward<U>(u);                // 写入数据，无竞争
-            // 更新尾指针，release保证数据写入后可见
+            if (n == hh) return false;                   // Queue full, enqueue fails
+            buf[lt] = std::forward<U>(u);                // Write data, no contention
+            // Update tail; release makes the written data visible
             t.store(n, std::memory_order_release);
             return true;
         }
 
-        // 多消费者出队：CAS竞争读取权，保证每个消息只被一个消费者读取
+        // Multi-consumer dequeue: CAS to claim the read, ensuring each message is consumed by exactly one consumer
         bool pop(T& out) {
             while (true) {
-                // 加载带版本的头指针，acquire保证读取到最新的版本和下标
+                // Load the versioned head; acquire ensures we see the latest version and index
                 auto lvh = vh.load(std::memory_order_acquire);
-                auto lh = lvh & IM;                      // 提取下标
-                auto lt = t.load(std::memory_order_relaxed); // 读取尾指针，判断队列是否空
-                if (lh == lt) return false;              // 队列空，出队失败
+                auto lh = lvh & IM;                      // Extract index
+                auto lt = t.load(std::memory_order_relaxed); // Read tail to check whether the queue is empty
+                if (lh == lt) return false;              // Queue empty, dequeue fails
 
-                // 版本号+1，生成新的带版本头指针，用于CAS竞争
+                // Version + 1, build the new versioned head for the CAS
                 size_t nv = (lvh >> IB) + 1;
                 size_t nvh = (nv << IB) | ((lh + 1) & MASK);
 
-                // CAS竞争读取权：多消费者同时竞争，只有一个能成功
-                // acq_rel保证CAS成功后，之前的读取操作可见，后续的写入操作可见
+                // CAS to claim the read: multiple consumers compete, only one succeeds
+                // acq_rel ensures that after a successful CAS, prior reads and subsequent writes are visible
                 if (vh.compare_exchange_strong(lvh, nvh, std::memory_order_acq_rel)) {
-                    out = std::move(buf[lh]);            // 移动数据，零拷贝
+                    out = std::move(buf[lh]);            // Move data, zero copy
                     return true;
                 }
-                // CAS失败，重试（HFT场景下通常会自旋重试，避免阻塞）
+                // CAS failed, retry (HFT code usually spins and retries rather than blocking)
             }
         }
     };
@@ -200,68 +200,68 @@ namespace tdsys {
 #include <array>
 
 namespace tdsys {
-    // 多生产者单消费者无锁队列，HFT多策略报盘、多数据源汇聚专用
+    // Multi-producer single-consumer lock-free queue, for HFT multi-strategy order submission and multi-source aggregation
     template<typename T, size_t SZ = 127>
     class MPSCQueue {
     private:
-        // 队列长度对齐为2的幂，HFT标准优化，位运算替代取模
+        // Queue length rounded up to a power of 2, standard HFT optimization, bit ops instead of modulo
         static constexpr size_t LEN = 1 << std::bit_width(SZ);
         static constexpr size_t MASK = LEN - 1;
-        // 版本号16位，下标16位，解决多生产者CAS竞争的ABA问题
+        // Version in the high bits, index in the low 16 bits, solving ABA under multi-producer CAS contention
         static constexpr size_t IB = 16;
         static constexpr size_t IM = (1ULL << IB) - 1;
 
-        // 队列元素包装：ok标记数据是否写入完成，多生产者场景必备
+        // Queue slot wrapper: ok marks whether the write has completed, required for multiple producers
         struct W {
             std::atomic<bool> ok{ false };
             T data{};
         };
 
-        // 头指针（消费者修改）、带版本的尾指针（多生产者CAS竞争修改），缓存行对齐
+        // Head (modified by consumer) and versioned tail (contended via CAS by multiple producers), cache-line aligned
         alignas(64) std::atomic<size_t> h{ 0 }, vt{ 0 };
-        std::array<W, LEN> buf{}; // 静态环形缓冲区，无动态内存分配
+        std::array<W, LEN> buf{}; // Static ring buffer, no dynamic memory allocation
 
     public:
-        // 单消费者出队：无竞争，延迟极低
+        // Single-consumer dequeue: no contention, very low latency
         bool pop(T& out) {
-            auto lh = h.load(std::memory_order_relaxed); // 读取头指针，relaxed无同步开销
-            // 读取带版本的尾指针，acquire保证可见性
+            auto lh = h.load(std::memory_order_relaxed); // Read head; relaxed has no sync overhead
+            // Read the versioned tail; acquire guarantees visibility
             auto tail = vt.load(std::memory_order_acquire) & IM;
-            if (lh == tail) return false;               // 队列空，出队失败
+            if (lh == tail) return false;               // Queue empty, dequeue fails
             auto& w = buf[lh];
-            if (!w.ok.load(std::memory_order_acquire)) return false; // 数据未就绪
-            out = std::move(w.data);                    // 移动语义，零拷贝
-            w.ok.store(false, std::memory_order_release); // 重置标记，允许下一次写入
-            // 更新头指针，release保证可见性
+            if (!w.ok.load(std::memory_order_acquire)) return false; // Data not ready yet
+            out = std::move(w.data);                    // Move semantics, zero copy
+            w.ok.store(false, std::memory_order_release); // Reset flag, allowing the next write
+            // Update head; release guarantees visibility
             h.store((lh + 1) & MASK, std::memory_order_release);
             return true;
         }
 
-        // 多生产者并发入队：CAS竞争写入权，无锁无阻塞
+        // Concurrent multi-producer enqueue: CAS to claim the write slot, lock-free and non-blocking
         template<typename U>
         bool push(U&& u) {
             size_t v;
             while (true) {
-                // 加载带版本的尾指针，acquire保证读取到最新值
+                // Load the versioned tail; acquire ensures we see the latest value
                 auto lvt = vt.load(std::memory_order_acquire);
-                auto lt = lvt & IM;                      // 提取下标
-                auto n = (lt + 1) & MASK;                // 计算下一个写入位置
-                // 读取头指针，判断队列是否满
+                auto lt = lvt & IM;                      // Extract index
+                auto n = (lt + 1) & MASK;                // Compute next write position
+                // Read head to check whether the queue is full
                 auto hh = h.load(std::memory_order_acquire) & IM;
-                if (n == hh) return false;               // 队列满，入队失败
+                if (n == hh) return false;               // Queue full, enqueue fails
 
-                // 版本号+1，生成新的带版本尾指针
+                // Version + 1, build the new versioned tail
                 v = (lvt >> IB) + 1;
                 size_t nvt = (v << IB) | n;
 
-                // CAS竞争写入权：多生产者同时竞争，只有一个能成功
+                // CAS to claim the write slot: multiple producers compete, only one succeeds
                 if (vt.compare_exchange_strong(lvt, nvt, std::memory_order_acq_rel)) {
                     auto& w = buf[lt];
-                    w.data = std::forward<U>(u);         // 完美转发，避免拷贝
-                    w.ok.store(true, std::memory_order_release); // 标记数据就绪
+                    w.data = std::forward<U>(u);         // Perfect forwarding, avoids copies
+                    w.ok.store(true, std::memory_order_release); // Mark data ready
                     return true;
                 }
-                // CAS失败，重试（HFT场景下自旋重试，无阻塞）
+                // CAS failed, retry (HFT code spins and retries, non-blocking)
             }
         }
     };
