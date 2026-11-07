@@ -360,7 +360,7 @@ namespace tdsys {
                 auto lvh = vh.load(std::memory_order_acquire);
                 auto lh = lvh & IM;                      // Extract index
                 // Read tail to check whether the queue is empty
-                auto lt = t.load(std::memory_order_relaxed);
+                auto lt = t.load(std::memory_order_acquire);
                 // Queue empty, dequeue fails
                 if (lh == lt) return false;
 

@@ -2,19 +2,23 @@
 
 #include <cstring>
 #include <iostream>
+#include <string>
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
-inline auto ASSERT(bool cond, const std::string &msg) noexcept {
-  if (UNLIKELY(!cond)) {
-    std::cerr << "ASSERT : " << msg << std::endl;
+/// ASSERT is a macro (not a function) so that the message expression - which is usually a
+/// std::string concatenation that heap-allocates - is only evaluated when the check FAILS.
+/// As a function, the message was built on every call, even on the success path.
+#define ASSERT(cond, msg)                                       \
+  do {                                                          \
+    if (UNLIKELY(!(cond))) {                                    \
+      std::cerr << "ASSERT : " << (msg) << std::endl;           \
+      exit(EXIT_FAILURE);                                       \
+    }                                                           \
+  } while (0)
 
-    exit(EXIT_FAILURE);
-  }
-}
-
-inline auto FATAL(const std::string &msg) noexcept {
+[[noreturn]] inline void FATAL(const std::string &msg) noexcept {
   std::cerr << "FATAL : " << msg << std::endl;
 
   exit(EXIT_FAILURE);

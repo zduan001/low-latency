@@ -30,3 +30,6 @@ target_link_libraries(logging_example PUBLIC ${LIBS})
 
 add_executable(socket_example socket_example.cpp)
 target_link_libraries(socket_example PUBLIC ${LIBS})
+
+add_executable(logging_benchmark logging_benchmark.cpp)
+target_link_libraries(logging_benchmark PUBLIC ${LIBS})
