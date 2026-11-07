@@ -2,6 +2,8 @@
 
 This is an asynchronous logger built for latency-critical threads such as trading, market-data and order-gateway threads. The thread that calls `log()` does only a fixed, small amount of work: it records the raw values and returns. All formatting and file I/O happen later on a background thread.
 
+New to the code? Read [Why this is a low-latency logger](#why-this-is-a-low-latency-logger) first, then [section 13](#13-c-techniques-used-in-loggingh) for the C++ techniques it relies on.
+
 | | Old logger | New logger |
 |---|---|---|
 | Hot-path work per message | 1 queue push **per character** of the format string and of each string argument, each with 2 seq_cst atomic operations | 1 record per message, published with 1 release store |
@@ -398,3 +400,81 @@ About the numbers:
 - **[`macros.h`](macros.h).** `ASSERT` is now a macro, so its message (usually a `std::string` concatenation that allocates) is built only when the assertion fails. As a function, the message was built on every call. `FATAL` is now `[[noreturn]]`.
 - **[`logging_example.cpp`](logging_example.cpp).** Shows the old API, the leveled macros, custom types and multi-threaded logging.
 - **[`logging_benchmark.cpp`](logging_benchmark.cpp)** + **[`CMakeLists.txt`](CMakeLists.txt).** New benchmark target.
+
+---
+
+## 13. C++ techniques used in `logging.h`
+
+This section lists the C++ techniques in [`logging.h`](logging.h), grouped by purpose. Each row says what the technique is, where it's used, and why it helps here.
+
+**If you're learning:** start with **1, 2, 3, 19, 20 and 22**. Those six explain most of why the logger is fast. Then move to **6, 8 and 12**, which explain most of why the code looks unusual.
+
+### 13.1 Templates and compile-time programming
+
+| # | Technique | Where | What it is | Benefit here |
+|---|---|---|---|---|
+| 1 | **Variadic templates / parameter packs** | `log(fmt, const Args&... args)` [L639](logging.h#L639), `write()` [L724](logging.h#L724) | A function that takes any number of arguments of any types, with all types known at compile time | One `log()` handles every call signature. The compiler generates code specialized for each call site, so no `va_list`, type tags or runtime dispatch are needed |
+| 2 | **Fold expressions** (C++17) | `(0 + ... + size(args))` [L733](logging.h#L733), `((cursor = encode(cursor, args)), ...)` [L745](logging.h#L745) | Applies an operator across every element of a pack in one expression | Sums the record size and encodes every argument with no recursion and no loop. The result compiles to straight-line code |
+| 3 | **Class template full specialization** | `template<> struct LogCodec<char>`, `<bool>`, `<std::string_view>` [L326](logging.h#L326) | A custom version of a template for one exact type | Each type gets its own copy and format rules, chosen at compile time |
+| 4 | **Class template partial specialization** | `LogCodec<char[N]>` [L315](logging.h#L315), `Decoder<A, Rest...>` [L457](logging.h#L457) | A custom version for a family of types (any `N`, any first type) | Covers every string-literal length and lets `Decoder` peel off one type at a time. Function templates can't be partially specialized, which is why these are structs |
+| 5 | **Undefined primary template** | `template<typename T> struct LogCodec;` [L168](logging.h#L168) | Declared, never defined | Logging an unsupported type fails **at compile time**, not at runtime |
+| 6 | **C++20 concepts and `requires`** | `LogInteger` [L211](logging.h#L211), `CharPointer` [L216](logging.h#L216), `LogFormattable` [L223](logging.h#L223), `requires std::is_enum_v<T>` | Named compile-time predicates on types, used to constrain templates | Picks the right codec for every integer, enum or pointer without writing out each type. The constraints don't overlap, so overload resolution is never ambiguous. Error messages are clearer than with SFINAE |
+| 7 | **`requires` expression** | `requires(LogWriter& w, const T& t) { formatLog(w, t); }` [L224](logging.h#L224) | Checks at compile time whether an expression is valid | Detects that a user type has a `formatLog()` and opts it in automatically, with no registration step |
+| 8 | **`consteval`** (C++20) | `FormatString` constructor [L379](logging.h#L379) | A function that **must** run at compile time | Counts the `%` placeholders during compilation. A mismatch is a compile error, and there is zero runtime cost |
+| 9 | **Calling a non-`constexpr` function to force a compile error** | `log_format_error_...()` [L357](logging.h#L357) | Constant evaluation cannot call it, so the compiler reports it | The function's name serves as a readable error message (the same trick `std::format` uses) |
+| 10 | **`std::type_identity_t` (non-deduced context)** | `FormatString<std::type_identity_t<Args>...>` [L639](logging.h#L639) | Stops the compiler from deducing `Args` from that parameter | `Args` is deduced only from the real arguments, and the format string is then checked against them. Without this, deduction would conflict |
+| 11 | **Reference-to-array parameter** | `const char (&s)[N]` [L379](logging.h#L379), [L315](logging.h#L315) | Takes an array without decaying it to a pointer | Keeps the length `N` at compile time, for counting placeholders and for `strnlen(s, N)` |
+| 12 | **Type erasure through template-generated function pointers** | `&Decoder<Args...>::run` stored in `RecordHeader::decode` [L742](logging.h#L742) | The compiler generates one decoder per argument-type list, and its address is stored as data | The background thread calls the right decoder without knowing the types: no `switch`, no type-tag bytes, no virtual functions or vtables |
+| 13 | **Recursive template instantiation** | `Decoder<A, Rest...>::run` calls `Decoder<Rest...>::run` [L461](logging.h#L461) | Compile-time recursion over a type list, ending at `Decoder<>` | Decodes each argument in order. It compiles to a flat sequence of calls |
+| 14 | **Type traits** | `std::remove_cvref_t`, `is_trivially_copyable_v`, `is_enum_v`, `underlying_type_t`, `is_floating_point_v` | Standard compile-time queries and transformations on types | `const std::string&` and `std::string` map to the same codec. `memcpy` is only allowed for types where it is safe |
+| 15 | **`if constexpr`** | `LOG_AT_LEVEL` [L968](logging.h#L968) | A branch evaluated at compile time; the discarded side is never run | Disabled log levels disappear completely, including evaluation of their arguments |
+| 16 | **`static_assert`** | `sizeof(RecordHeader) == 32` [L413](logging.h#L413) | A compile-time check | Locks in the record layout the code depends on, so an accidental padding change can't slip through |
+| 17 | **Argument-dependent lookup (ADL) as a customization point** | `formatLog(w, t)` [L345](logging.h#L345) | An unqualified call also searches the argument's namespace | Users add `formatLog` next to their own type and never modify `logging.h` (the same pattern `swap` and `std::hash` use) |
+| 18 | **Inheritance for code reuse (mixin base)** | `LogCodec<T> : TrivialCopy<T>` [L176](logging.h#L176), `LogCodec<std::string> : LogCodec<std::string_view>` [L337](logging.h#L337) | A base struct supplies shared static functions | Writes `size`/`encode` once for every plain-data type. `std::string` reuses the `string_view` codec unchanged |
+
+### 13.2 Memory and concurrency
+
+| # | Technique | Where | What it is | Benefit here |
+|---|---|---|---|---|
+| 19 | **`std::atomic` with explicit memory orders** | `commit()` release [L524](logging.h#L524), `peek()` acquire [L538](logging.h#L538), relaxed own-index loads | Use the weakest ordering that is still correct, instead of the seq_cst default | On x86, a release store is a plain `mov`, while seq_cst is `xchg`, a full fence. That cost is saved on every message |
+| 20 | **Acquire/release publication** | the producer writes the record, then release-stores `write_pos_`; the consumer acquire-loads it, then reads the record | A happens-before handoff between two threads | The consumer is guaranteed to see the complete record without any lock |
+| 21 | **Single-writer variables** | `dropped_.store(load() + 1)` [L505](logging.h#L505), `write_pos_`, `read_pos_` | Each variable has exactly one writing thread | Plain load + store replaces `fetch_add`, so no `lock` prefix is needed |
+| 22 | **`alignas(64)` cache-line separation** | `write_pos_` [L566](logging.h#L566), `read_pos_` [L572](logging.h#L572), `Logger` member groups | Places data on separate 64-byte cache lines | Avoids **false sharing**: one core's writes don't invalidate the other core's cached line |
+| 23 | **Cached copy of the other thread's index** | `cached_read_pos_` [L567](logging.h#L567), `cached_write_pos_` [L538](logging.h#L538) | Keeps a private, possibly stale copy and refreshes it only when necessary | In the common case the hot path never reads the other core's cache line |
+| 24 | **Monotonic 64-bit positions + power-of-two masking** | `pos & mask_` [L496](logging.h#L496), `std::bit_ceil` [L473](logging.h#L473) | Positions only ever increase, and the buffer offset is `pos & (size-1)` | No modulo `div` (about 30 cycles), no shared counter, and full vs empty is a simple subtraction |
+| 25 | **`thread_local` with constant initialization** | `static thread_local TlsEntry cache[4] = {}` [L710](logging.h#L710) | Per-thread storage; a trivial type with a constant initializer needs no init guard | Finding the thread's ring is one `%fs`-relative load |
+| 26 | **Placement `new`** | `new(record) RecordHeader{...}` [L740](logging.h#L740) | Constructs an object in memory you already own | Writes the header directly into the ring, with no allocation and no copy |
+| 27 | **`std::memcpy` for type punning / unaligned access** | every codec `encode`/`decode`, e.g. [L179](logging.h#L179) | Copies object bytes instead of casting pointers | Arguments are packed tightly at arbitrary alignment. `memcpy` is the well-defined way to do this, and compilers turn it into one `mov` |
+| 28 | **`std::launder`** | `LogFormattable` decode [L345](logging.h#L345) | Tells the compiler that a pointer to bytes now refers to a `T` object | Makes reading a user struct back from raw bytes well-defined |
+| 29 | **Brace (aggregate) initialization** | `RecordHeader{{size, kind, level, 0}, tsc, fmt, decode}` [L740](logging.h#L740) | Initializes the struct's fields directly | Compiles to plain stores with no constructor overhead |
+
+### 13.3 Low-level performance tools
+
+| # | Technique | Where | What it is | Benefit here |
+|---|---|---|---|---|
+| 30 | **Branch hints `__builtin_expect`** | `LIKELY` / `UNLIKELY` [macros.h:7](macros.h#L7) | Tells the compiler which side of a branch is the common one | Keeps the fast path as straight-line code, with the full/drop/slow-path branches moved out of line |
+| 31 | **Intrinsics `__rdtsc`, `_mm_pause`** | [L415](logging.h#L415), [L423](logging.h#L423) | Single CPU instructions exposed as functions | A timestamp in a few ns with no syscall. `pause` makes the background thread's spin loop cheaper for its hyper-thread sibling |
+| 32 | **`__builtin_prefetch`** | [L517](logging.h#L517) | Asks the CPU to fetch a cache line early | Starts fetching the next record's cache lines ahead of time. It made no measurable difference on this machine (see section 10) |
+| 33 | **`std::to_chars`** (C++17) | `LogWriter::appendNumber` [L107](logging.h#L107) | Converts numbers to text with no locale, no allocation and no exceptions | Several times faster than `ostream <<` or `snprintf`; produces the shortest round-trip form for floats |
+| 34 | **`std::string_view`** | codecs [L326](logging.h#L326), `LogWriter::append` | A non-owning (pointer, length) view of a string | Passes strings around without copies or allocations |
+| 35 | **`noexcept`** | almost every function | A promise that the function never throws | No exception-handling paths in the hot code, and a clear contract that logging never throws |
+| 36 | **OS memory control: `mmap`, `madvise(MADV_HUGEPAGE)`, `mlock`, pre-fault `memset`** | [L476-L480](logging.h#L476-L480) | Explicit control over how the ring's memory is mapped | No page faults or swapping on the hot path, and fewer TLB misses |
+
+### 13.4 Resource management and API design
+
+| # | Technique | Where | What it is | Benefit here |
+|---|---|---|---|---|
+| 37 | **RAII** | `std::unique_ptr<char[]>` [L156](logging.h#L156), `std::lock_guard` [L774](logging.h#L774), the `Logger` destructor drains and joins | Each resource is tied to an object's lifetime | Shutdown can't leak memory or lose messages, and the mutex can't be left locked |
+| 38 | **Deleted copy/move operations** | `Logger(const Logger&) = delete` [L684](logging.h#L684) | Forbids copying | Rings and the background thread are owned exactly once; an accidental copy is a compile error |
+| 39 | **Preprocessor: stringify + literal concatenation** | `LOG_STRINGIFY(__LINE__)`, `__FILE_NAME__ ":" "52" " " fmt` [L963-L976](logging.h#L963-L976) | `#x` turns a macro argument into a string; adjacent literals are merged by the compiler | `file:line` becomes part of the format literal, so the source location costs nothing at runtime |
+| 40 | **`__VA_OPT__`** (C++20) | `LOG_*` macros [L966](logging.h#L966) | Inserts the comma only when there are variadic arguments | `LOG_INFO(l, "text")` and `LOG_INFO(l, "x:%", x)` both work, with no GNU `##__VA_ARGS__` extension |
+| 41 | **`do { ... } while (0)` macro wrapper** | `LOG_AT_LEVEL` [L966](logging.h#L966), `ASSERT` [macros.h:13](macros.h#L13) | Makes a multi-statement macro act like one statement | Safe inside `if/else` without braces |
+
+### 13.5 How they combine
+
+- **Compile-time techniques** (1–18, 39–40): everything that can be known before the program runs is worked out by the compiler. That covers types, sizes, format checking, file:line and level filtering.
+- **Concurrency techniques** (19–25): the necessary sharing between threads costs one plain store and almost no cache-line traffic.
+- **Memory techniques** (26–29, 36): bytes go straight into pre-faulted memory, with no allocation and no undefined behavior.
+- **Low-level tools** (30–35): the remaining instructions are cheap and predictable.
+
+> Line links point at the current version of `logging.h`. They will shift as the file is edited.
