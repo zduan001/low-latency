@@ -2,8 +2,118 @@
 #include <atomic>
 #include <array>
 #include <semaphore.h>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
 
 namespace tdsys {
+    // Bounded multi-producer multi-consumer queue (Vyukov-style sequence
+    // numbers). push/pop never block and never take a lock: a thread only
+    // retries when another thread made progress, so the queue is lock-free.
+    //
+    // How it works:
+    // - head and tail are 64-bit counters that only ever grow. A counter
+    //   value is a "ticket"; its slot is buf[ticket & MASK]. Because the
+    //   counters never wrap in practice, there is no ABA problem and no
+    //   version bits are needed.
+    // - Every slot carries a sequence number seq that says whose turn it is:
+    //     seq == ticket         -> slot is empty, producer `ticket` may write
+    //     seq == ticket + 1     -> slot is full, consumer `ticket` may read
+    //     seq == ticket + LEN   -> consumer done, slot is empty for the
+    //                              producer one lap later
+    // - A producer reads tail, checks the slot's seq, and claims the ticket
+    //   with a CAS on tail. Only the CAS winner touches that slot, then it
+    //   publishes the data by storing seq = ticket + 1 (release).
+    // - A consumer does the mirror image on head, then frees the slot for
+    //   the next lap by storing seq = ticket + LEN (release).
+    // - The acquire load of seq pairs with those release stores, so a
+    //   consumer that sees seq == ticket + 1 also sees the payload, and a
+    //   producer that sees seq == ticket also sees the consumer finished.
+    template<typename T, size_t SZ = 127>
+    class MPMCQueue {
+    private:
+        // Power-of-2 length so ticket & MASK replaces ticket % LEN
+        static constexpr size_t LEN = 1 << std::bit_width(SZ);
+        static constexpr size_t MASK = LEN - 1;
+
+        // Each slot on its own cache line: neighbouring slots are written by
+        // different threads, so sharing a line would cause false sharing
+        struct alignas(64) Slot {
+            std::atomic<size_t> seq;
+            T data{};
+        };
+
+        // Producers contend on tail, consumers on head: separate cache lines
+        alignas(64) std::atomic<size_t> head{ 0 };
+        alignas(64) std::atomic<size_t> tail{ 0 };
+        std::array<Slot, LEN> buf;
+
+    public:
+        // Slot i starts empty and waiting for producer ticket i
+        MPMCQueue() {
+            for (size_t i = 0; i < LEN; ++i)
+                buf[i].seq.store(i, std::memory_order_relaxed);
+        }
+
+        // Returns false if the queue is full
+        template<typename U>
+        bool push(U&& u) {
+            size_t pos = tail.load(std::memory_order_relaxed);
+            while (true) {
+                Slot& s = buf[pos & MASK];
+                size_t seq = s.seq.load(std::memory_order_acquire);
+                // Signed difference handles counter wrap-around correctly
+                auto diff = static_cast<intptr_t>(seq)
+                          - static_cast<intptr_t>(pos);
+                if (diff == 0) {
+                    // Slot is free for ticket pos: try to claim it. On
+                    // failure the CAS reloads pos with the current tail.
+                    if (tail.compare_exchange_weak(
+                            pos, pos + 1, std::memory_order_relaxed)) {
+                        s.data = std::forward<U>(u);
+                        // Hand the slot to consumer ticket pos
+                        s.seq.store(pos + 1, std::memory_order_release);
+                        return true;
+                    }
+                } else if (diff < 0) {
+                    // Slot still holds data from the previous lap: full
+                    return false;
+                } else {
+                    // Another producer already took pos: catch up
+                    pos = tail.load(std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // Returns false if the queue is empty
+        bool pop(T& out) {
+            size_t pos = head.load(std::memory_order_relaxed);
+            while (true) {
+                Slot& s = buf[pos & MASK];
+                size_t seq = s.seq.load(std::memory_order_acquire);
+                auto diff = static_cast<intptr_t>(seq)
+                          - static_cast<intptr_t>(pos + 1);
+                if (diff == 0) {
+                    // Slot holds data for ticket pos: try to claim it
+                    if (head.compare_exchange_weak(
+                            pos, pos + 1, std::memory_order_relaxed)) {
+                        out = std::move(s.data);
+                        // Free the slot for producer ticket pos + LEN
+                        s.seq.store(pos + LEN, std::memory_order_release);
+                        return true;
+                    }
+                } else if (diff < 0) {
+                    // Producer for this ticket has not published yet: empty
+                    return false;
+                } else {
+                    // Another consumer already took pos: catch up
+                    pos = head.load(std::memory_order_relaxed);
+                }
+            }
+        }
+    };
+
     // Multi-producer single-consumer queue with a semaphore, for
     // non-latency-critical HFT auxiliary channels
     template<typename T, size_t SZ = 127>
